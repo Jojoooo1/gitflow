@@ -1,0 +1,93 @@
+name: "Dev - Deploy to Staging"
+
+# Note: Execute when feature branch is merge into develop this CI will be executed.
+
+on:
+  pull_request:
+    types: [ closed ]
+    branches: [ develop ]
+
+env:
+  PROJECT_ID: YOUR_PROJECT_ID_STG
+  PROJECT_SA_KEY: ${{ secrets.YOUR_SA_KEY_STG }}
+  IMAGE_NAME: YOUR_DOCKER_IMAGE
+
+concurrency:
+  group: ci-deploy-dev-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dev-deploy:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.merged == true
+    outputs:
+      IMAGE_TAG: ${{ steps.variables.outputs.IMAGE_TAG }}
+      IMAGE_REGISTRY: ${{ steps.variables.outputs.IMAGE_REGISTRY }}
+    steps:
+
+      # 1. Setup
+      - uses: actions/checkout@v3
+        with:
+          ref: ${{ github.head_ref }}
+      - name: Set up JDK
+        uses: actions/setup-java@v3.9.0
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'maven'
+
+      # 2. Skip Test
+      #      - name: Run Unit & Integration Tests
+      #        run: mvn clean verify
+
+      # 3. Setup gcloud
+      # Note: Needs to have STORAGE ADMIN role if FIRST push to registry (will create the bucket). Then use Storage Legacy Bucket Writer at bucket level (can not be set a project level)
+      - id: auth
+        uses: google-github-actions/auth@v1.0.0
+        with:
+          credentials_json: ${{ env.PROJECT_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1.0.1
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      # 4. Configure docker to use gcloud as a credential helper
+      - name: Setup docker to authenticate via gcloud
+        run: gcloud --quiet  auth configure-docker gcr.io
+
+      # 5. Echo ENV_VARIABLE
+      - name: echo ENV_VARIABLE
+        id: variables
+        run: |
+          IMAGE_REGISTRY="gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}"
+          IMAGE_TAG="dev-${{ github.run_number }}"
+
+          # Echo variables
+          echo "IMAGE_REGISTRY=$IMAGE_REGISTRY"
+          echo "IMAGE_TAG=$IMAGE_TAG"
+
+          # Set variables in env & output
+          echo "IMAGE_REGISTRY=$IMAGE_REGISTRY" >> $GITHUB_ENV
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+          
+          echo "::set-output name=IMAGE_TAG::${IMAGE_TAG}"
+          echo "::set-output name=IMAGE_REGISTRY::${IMAGE_REGISTRY}"
+
+      # 6. Push to image registry
+      - name: Deploy image
+        run: |
+          mvn clean compile jib:build --no-transfer-progress \
+            -Djib.to.image=$IMAGE_REGISTRY \
+            -Djib.to.tags=$IMAGE_TAG
+
+      # 7. Notify if fails
+      - name: Notify fails
+        if: failure()
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_WEBHOOK_ALERT }}
+        uses: voxmedia/github-action-slack-notify-build@v1
+        with:
+          channel: github-alerts
+          status: FAILED
+          color: danger

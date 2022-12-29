@@ -1,0 +1,46 @@
+name: "Dev - Test"
+
+# Note: Every time a pull request is open from develop this CI will be executed.
+
+on:
+  pull_request:
+    types: [ opened, synchronize, reopened ] # Note: default value
+    branches: [ develop ]
+
+concurrency:
+  group: ci-dev-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Note: Jobs name are used for status check purposes.
+  dev-test:
+    runs-on: ubuntu-latest
+    steps:
+
+      # 1. Setup
+      - uses: actions/checkout@v3
+        with:
+          ref: ${{ github.head_ref }}
+      - name: Set up JDK
+        uses: actions/setup-java@v3.9.0
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'maven'
+
+      # 2. Tests
+      - name: Run Unit & Integration Tests
+        run: mvn clean verify --no-transfer-progress
+
+      # 3. Notify if fails
+      - name: Notify if fails
+        if: failure()
+        uses: voxmedia/github-action-slack-notify-build@v1
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_WEBHOOK_ALERT }}
+        with:
+          channel: github-alerts
+          status: FAILED
+          color: danger
+
+

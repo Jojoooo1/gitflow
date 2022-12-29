@@ -1,0 +1,127 @@
+name: "Release Candidate - Test & Deploy to Test"
+
+# Note: Every time a pull request is open from main using 'release/' - 'hotfix/' this CI will be executed.
+
+on:
+  pull_request:
+    types: [ opened, synchronize, reopened ] # Note: default value.
+    branches: [ main ]
+
+env:
+  PROJECT_ID: YOUR_PROJECT_ID_TEST
+  PROJECT_SA_KEY: ${{ secrets.YOUR_SA_KEY_TEST }}
+  IMAGE_NAME: YOUR_DOCKER_IMAGE
+
+concurrency:
+  group: ci-deploy-rc-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  rc-test:
+    if: contains(toJSON(github.head_ref), 'release/') || contains(toJSON(github.head_ref), 'hotfix/')
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Setup
+      - uses: actions/checkout@v3
+        with:
+          ref: ${{ github.head_ref }}
+      - name: Set up JDK
+        uses: actions/setup-java@v3.9.0
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'maven'
+
+      # 2. Test
+      - name: Run Unit & Integration Tests
+        run: mvn clean verify --no-transfer-progress
+
+  rc-deploy:
+    needs: [ rc-test ]
+    runs-on: ubuntu-latest
+    outputs:
+      IMAGE_TAG: ${{ steps.variables.outputs.IMAGE_TAG }}
+      IMAGE_REGISTRY: ${{ steps.variables.outputs.IMAGE_REGISTRY }}
+
+    steps:
+      # 1. Setup
+      - uses: actions/checkout@v3
+        # Note: By default, a pull request creates a new SHA (identifier)
+        # Note: We set the ref to head_ref, in order to get the RELEASE_VERSION from the branch
+        with:
+          ref: ${{ github.head_ref }}
+      - name: Set up JDK
+        uses: actions/setup-java@v3.9.0
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'maven'
+
+      # 2.1 Sets variables
+      - name: Sets release variables
+        id: variables
+        run: |
+          git fetch --prune --prune-tags origin
+
+          # 1. Get tags
+          LATEST_TAG=$(git describe --tags "$(git rev-list --tags --max-count=1)") # gets tags across all branches, not just the current branch
+          TAG_LIST=($(echo $LATEST_TAG | tr '.' ' '))
+          [[ "${#TAG_LIST[@]}" -ne 2 ]] && echo "$RELEASE_VERSION is not a valid version" && exit 1
+
+          # 2. Set release version
+          if [[ "$GITHUB_HEAD_REF" == release* ]]
+          then
+            RELEASE_VERSION=$(( TAG_LIST[0] + 1 )).0;
+          else
+            RELEASE_VERSION=${TAG_LIST[0]}.$(( TAG_LIST[1] + 1));
+          fi
+          
+          # 3. Set vars
+          IMAGE_REGISTRY="gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}"
+          IMAGE_TAG=${RELEASE_VERSION}-$(git rev-parse --short=4 HEAD)-rc
+          
+          # 4. Set envs & outputs
+          echo "IMAGE_REGISTRY=$IMAGE_REGISTRY" >> $GITHUB_ENV
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+          echo "::set-output name=IMAGE_TAG::${IMAGE_TAG}"
+          echo "::set-output name=IMAGE_REGISTRY::${IMAGE_REGISTRY}"
+
+      # 2.2 Echo variables
+      - name: Echo variables
+        run: |
+          echo "IMAGE_TAG=$IMAGE_TAG"
+          echo "IMAGE_REGISTRY=$IMAGE_REGISTRY"
+
+      # 3. Setup gcloud
+      - id: auth
+        uses: google-github-actions/auth@v1.0.0
+        with:
+          credentials_json: ${{ env.PROJECT_SA_KEY }} # Note: Needs to have storage admin role if first push to registry (create the bucket)
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1.0.1
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      # 4. Configure docker to use gcloud as a credential helper
+      - name: Setup docker to authenticate via gcloud
+        run: gcloud --quiet  auth configure-docker gcr.io
+
+      # 5. Push to image registry
+      - name: Deploy image
+        run: |
+          mvn clean compile jib:build --no-transfer-progress \
+            -Djib.to.image=$IMAGE_REGISTRY \
+            -Djib.to.tags=$IMAGE_TAG
+
+      # 6. Notify if fails
+      - name: Notify fails
+        if: failure()
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_WEBHOOK_ALERT }}
+        uses: voxmedia/github-action-slack-notify-build@v1
+        with:
+          channel: github-alerts
+          status: FAILED
+          color: danger
